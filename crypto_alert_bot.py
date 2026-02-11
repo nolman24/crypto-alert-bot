@@ -44,7 +44,7 @@ def get_token_data(chain, mint):
         data = requests.get(url, timeout=10).json()
         pairs = data.get("pairs")
         if not pairs:
-            return None, None, None, None
+            return None, None, None, None, None
         pair = pairs[0]
         price = float(pair["priceUsd"])
         name = pair["baseToken"]["name"]
@@ -66,6 +66,20 @@ def detect_chain(mint):
         if price:
             return chain
     return None
+
+
+# ================= FORMAT CHANGES =================
+def format_changes(price_changes):
+    intervals = ["m5", "h1", "h6", "d1"]
+    names = {"m5": "5 min", "h1": "1 hr", "h6": "6 hr", "d1": "24 hr"}
+    display = ""
+    for key in intervals:
+        pct = price_changes.get(key)
+        if pct is not None:
+            display += f"{names[key]}: {pct:.2f}%\n"
+        else:
+            display += f"{names[key]}: N/A\n"
+    return display
 
 
 # ================= COMMAND HANDLER =================
@@ -162,17 +176,29 @@ def handle_commands():
             alerts[:] = [a for a in alerts if a not in removed]
             send_message(f"✅ Percent alert for {token} at {percent}% removed")
 
+        # ===== Delete by Number =====
+        elif cmd == "/delete" and len(parts) == 2:
+            try:
+                idx = int(parts[1]) - 1
+                if 0 <= idx < len(alerts):
+                    removed = alerts.pop(idx)
+                    send_message(f"✅ Alert #{parts[1]} ({removed['name']} {removed['symbol']}) deleted")
+                else:
+                    send_message("❌ Invalid alert number")
+            except ValueError:
+                send_message("❌ Please enter a valid number")
+
         # ===== List Alerts =====
         elif cmd == "/list":
             if not alerts:
                 send_message("No active alerts")
             else:
                 msg = "📊 Active Alerts:\n\n"
-                for a in alerts:
+                for i, a in enumerate(alerts, 1):
                     if a["type"] == "price":
-                        msg += f"{a['name']} ({a['symbol']}) - Price: ${a['target']} [{a['chain']}]\n"
+                        msg += f"{i}. {a['name']} ({a['symbol']}) - Price: ${a['target']} [{a['chain']}]\n"
                     else:
-                        msg += f"{a['name']} ({a['symbol']}) - Percent: {a['percent']}% {a['timeframe']} [{a['chain']}]\n"
+                        msg += f"{i}. {a['name']} ({a['symbol']}) - Percent: {a['percent']}% {a['timeframe']} [{a['chain']}]\n"
                 send_message(msg)
 
 
@@ -192,14 +218,10 @@ def check_alerts():
             if price >= alert["target"]:
                 send_message(
                     f"🚨🚨 DEX PRICE ALERT 🚨🚨\n\n"
-                    f"{name} ({symbol}) went above ${alert['target']}\n\n"
+                    f"{alert['name']} ({alert['symbol']}) went above ${alert['target']}\n\n"
                     f"Current Price: ${price:.8f}\n"
                     f"Market Cap: {mc}\n\n"
-                    f"Change (from DexScreener):\n"
-                    f"5 min: {price_changes.get('m5', 'N/A')}%\n"
-                    f"1 hr: {price_changes.get('h1', 'N/A')}%\n"
-                    f"6 hr: {price_changes.get('h6', 'N/A')}%\n"
-                    f"24 hr: {price_changes.get('d1', 'N/A')}%\n\n"
+                    f"Change (from DexScreener):\n{format_changes(price_changes)}\n"
                     f"📈 Chart: {chart_url}"
                 )
             else:
@@ -219,14 +241,10 @@ def check_alerts():
             if pct_change >= alert["percent"]:
                 send_message(
                     f"🚨🚨 DEX PRICE ALERT 🚨🚨\n\n"
-                    f"{name} ({symbol}) moved +{pct_change:.2f}% over {alert['timeframe']}\n\n"
+                    f"{alert['name']} ({alert['symbol']}) moved +{pct_change:.2f}% over {alert['timeframe']}\n\n"
                     f"Current Price: ${price:.8f}\n"
                     f"Market Cap: {mc}\n\n"
-                    f"Change (from DexScreener):\n"
-                    f"5 min: {price_changes.get('m5', 'N/A')}%\n"
-                    f"1 hr: {price_changes.get('h1', 'N/A')}%\n"
-                    f"6 hr: {price_changes.get('h6', 'N/A')}%\n"
-                    f"24 hr: {price_changes.get('d1', 'N/A')}%\n\n"
+                    f"Change (from DexScreener):\n{format_changes(price_changes)}\n"
                     f"📈 Chart: {chart_url}"
                 )
             else:
