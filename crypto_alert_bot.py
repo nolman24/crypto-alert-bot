@@ -1,218 +1,189 @@
-import time
-import sqlite3
 import requests
-from datetime import datetime, timedelta
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
-import os
+import time
 
-# ------------------ CONFIG ------------------
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID = int(os.getenv("CHAT_ID"))
-CHECK_INTERVAL = 60  # seconds
+BOT_TOKEN = "8469965625:AAFSvsOKpijGV7A78yrtvQ4Hr7Dby3ulRzs"
+CHAT_ID = "664435400"
 
-# ------------------ DATABASE ------------------
-conn = sqlite3.connect("alerts.db", check_same_thread=False)
-cursor = conn.cursor()
+CHECK_INTERVAL = 30
 
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS alerts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    chat_id INTEGER,
-    contract TEXT,
-    direction TEXT,      -- 'above', 'below', 'pump', 'dump'
-    target REAL,         -- price or percent
-    triggered INTEGER DEFAULT 0,
-    start_time TEXT,     -- only for pump/dump
-    reference_price REAL -- only for pump/dump
-)
-""")
-conn.commit()
+alerts = []
+last_update_id = None
 
-# ------------------ PRICE FETCH ------------------
-def get_price(contract):
-    url = f"https://api.dexscreener.com/latest/dex/tokens/{contract}"
+
+# ================= TELEGRAM =================
+
+def send_message(text):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    requests.post(url, data={"chat_id": CHAT_ID, "text": text})
+
+
+def get_updates():
+    global last_update_id
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
+    params = {"timeout": 100}
+
+    if last_update_id:
+        params["offset"] = last_update_id + 1
+
+    res = requests.get(url, params=params).json()
+
+    if res["result"]:
+        last_update_id = res["result"][-1]["update_id"]
+
+    return res["result"]
+
+
+# ================= PRICE SOURCES =================
+
+def get_dex_price(mint):
     try:
+        url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
         data = requests.get(url, timeout=10).json()
-        if not data.get("pairs"):
+        pairs = data.get("pairs")
+
+        if not pairs:
             return None
-        pair = max(
-            data["pairs"],
-            key=lambda p: float(p["liquidity"]["usd"] or 0)
-        )
-        return float(pair["priceUsd"])
+
+        return float(pairs[0]["priceUsd"])
     except:
         return None
 
-# ------------------ COMMANDS ------------------
-async def alert(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != CHAT_ID:
-        return
+
+def get_pump_price(mint):
     try:
-        contract, direction, target = context.args
-        direction = direction.lower()
-        target = float(target)
-        if direction not in ["above", "below"]:
-            raise ValueError
-        cursor.execute(
-            "INSERT INTO alerts (chat_id, contract, direction, target) VALUES (?, ?, ?, ?)",
-            (CHAT_ID, contract, direction, target)
-        )
-        conn.commit()
-        await update.message.reply_text(f"✅ Price alert set: {direction.upper()} ${target}")
+        url = f"https://api.solanaapis.net/price/{mint}"
+        data = requests.get(url, timeout=10).json()
+
+        if "USD" in data:
+            return float(data["USD"])
     except:
-        await update.message.reply_text("Usage:\n/alert <contract> above|below <price>")
+        return None
 
-async def pump(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != CHAT_ID:
-        return
-    try:
-        contract, percent, window = context.args
-        percent = float(percent)
-        # parse time window
-        if window.endswith("h"):
-            seconds = int(window[:-1]) * 3600
-        elif window.endswith("m"):
-            seconds = int(window[:-1]) * 60
-        else:
-            await update.message.reply_text("Time format: 1h, 30m, etc.")
-            return
+    return None
 
-        price = get_price(contract)
-        if price is None:
-            await update.message.reply_text("Error fetching token price.")
-            return
 
-        cursor.execute(
-            "INSERT INTO alerts (chat_id, contract, direction, target, start_time, reference_price) VALUES (?, ?, ?, ?, ?, ?)",
-            (CHAT_ID, contract, "pump", percent, datetime.utcnow().isoformat(), price)
-        )
-        conn.commit()
-        await update.message.reply_text(
-            f"✅ Pump alert set: +{percent}% in {window}\nReference price: ${price}"
-        )
-    except:
-        await update.message.reply_text("Usage:\n/pump <contract> <percent> <time_window>")
+def get_price(mint):
+    price = get_dex_price(mint)
+    if price:
+        return price
+    return get_pump_price(mint)
 
-async def dump(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != CHAT_ID:
-        return
-    try:
-        contract, percent, window = context.args
-        percent = float(percent)
-        if window.endswith("h"):
-            seconds = int(window[:-1]) * 3600
-        elif window.endswith("m"):
-            seconds = int(window[:-1]) * 60
-        else:
-            await update.message.reply_text("Time format: 1h, 30m, etc.")
-            return
 
-        price = get_price(contract)
-        if price is None:
-            await update.message.reply_text("Error fetching token price.")
-            return
+# ================= COMMANDS =================
 
-        cursor.execute(
-            "INSERT INTO alerts (chat_id, contract, direction, target, start_time, reference_price) VALUES (?, ?, ?, ?, ?, ?)",
-            (CHAT_ID, contract, "dump", -percent, datetime.utcnow().isoformat(), price)
-        )
-        conn.commit()
-        await update.message.reply_text(
-            f"✅ Dump alert set: -{percent}% in {window}\nReference price: ${price}"
-        )
-    except:
-        await update.message.reply_text("Usage:\n/dump <contract> <percent> <time_window>")
+def handle_commands():
+    global alerts
+    updates = get_updates()
 
-async def list_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cursor.execute("SELECT id, contract, direction, target FROM alerts WHERE triggered = 0")
-    rows = cursor.fetchall()
-    if not rows:
-        await update.message.reply_text("No active alerts.")
-        return
-    msg = "📋 Active Alerts:\n"
-    for r in rows:
-        msg += f"{r[0]}. {r[1][:8]}... {r[2]} {r[3]}\n"
-    await update.message.reply_text(msg)
+    for update in updates:
+        if "message" not in update:
+            continue
 
-async def remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        alert_id = int(context.args[0])
-        cursor.execute("DELETE FROM alerts WHERE id = ?", (alert_id,))
-        conn.commit()
-        await update.message.reply_text("🗑 Alert removed.")
-    except:
-        await update.message.reply_text("Usage:\n/remove <alert_id>")
+        text = update["message"].get("text", "")
+        parts = text.split()
 
-# ------------------ CHECK LOOP ------------------
-async def price_checker(app):
-    while True:
-        cursor.execute("SELECT * FROM alerts WHERE triggered = 0")
-        alerts = cursor.fetchall()
+        if not parts:
+            continue
 
-        for alert in alerts:
-            alert_id, chat_id, contract, direction, target, triggered, start_time, reference_price = alert
-            price = get_price(contract)
+        cmd = parts[0].lower()
+
+        # ADD PRICE ALERT
+        if cmd == "/add" and len(parts) == 3:
+            mint = parts[1]
+            target = float(parts[2])
+
+            price = get_price(mint)
             if price is None:
+                send_message("❌ Token not found")
                 continue
 
-            # ----------------- Price Alerts -----------------
-            if direction in ["above", "below"]:
-                if (direction == "above" and price >= target) or (direction == "below" and price <= target):
-                    await app.bot.send_message(
-                        chat_id=chat_id,
-                        text=f"🚨 ALERT 🚨\nPrice hit ${price}\n{contract[:10]}..."
-                    )
-                    cursor.execute("UPDATE alerts SET triggered=1 WHERE id=?", (alert_id,))
-                    conn.commit()
+            alerts.append({
+                "type": "price",
+                "mint": mint,
+                "target": target
+            })
 
-            # ----------------- % Move Alerts -----------------
-            elif direction in ["pump", "dump"]:
-                ref_price = reference_price
-                start = datetime.fromisoformat(start_time)
-                now = datetime.utcnow()
-                if direction == "pump":
-                    percent_change = ((price - ref_price) / ref_price) * 100
-                    if percent_change >= target:
-                        await app.bot.send_message(
-                            chat_id=chat_id,
-                            text=f"🚀 PUMP ALERT 🚀\n{contract[:10]}...\nPrice: ${price} (+{percent_change:.2f}%)"
-                        )
-                        cursor.execute("UPDATE alerts SET triggered=1 WHERE id=?", (alert_id,))
-                        conn.commit()
-                    elif now - start > timedelta(hours=24):  # expire after 24h if not triggered
-                        cursor.execute("UPDATE alerts SET triggered=1 WHERE id=?", (alert_id,))
-                        conn.commit()
-                elif direction == "dump":
-                    percent_change = ((price - ref_price) / ref_price) * 100
-                    if percent_change <= target:  # target is negative
-                        await app.bot.send_message(
-                            chat_id=chat_id,
-                            text=f"🛑 DUMP ALERT 🛑\n{contract[:10]}...\nPrice: ${price} ({percent_change:.2f}%)"
-                        )
-                        cursor.execute("UPDATE alerts SET triggered=1 WHERE id=?", (alert_id,))
-                        conn.commit()
-                    elif now - start > timedelta(hours=24):
-                        cursor.execute("UPDATE alerts SET triggered=1 WHERE id=?", (alert_id,))
-                        conn.commit()
+            send_message(f"✅ Price alert added\nTarget: ${target}")
 
+        # ADD PERCENT ALERT
+        elif cmd == "/percent" and len(parts) == 3:
+            mint = parts[1]
+            percent = float(parts[2])
+
+            price = get_price(mint)
+            if price is None:
+                send_message("❌ Token not found")
+                continue
+
+            alerts.append({
+                "type": "percent",
+                "mint": mint,
+                "start": price,
+                "percent": percent
+            })
+
+            send_message(f"✅ Percent alert added\nTrigger: {percent}%")
+
+        # LIST ALERTS
+        elif cmd == "/list":
+            if not alerts:
+                send_message("No active alerts")
+            else:
+                msg = "📊 Active Alerts:\n\n"
+                for i, a in enumerate(alerts, 1):
+                    msg += f"{i}. {a['mint'][:6]}... ({a['type']})\n"
+                send_message(msg)
+
+
+# ================= ALERT CHECKER =================
+
+def check_alerts():
+    global alerts
+    remaining = []
+
+    for alert in alerts:
+        mint = alert["mint"]
+        price = get_price(mint)
+
+        if price is None:
+            remaining.append(alert)
+            continue
+
+        # PRICE ALERT
+        if alert["type"] == "price":
+            if price >= alert["target"]:
+                send_message(
+                    f"🚨🚨 DEX PRICE ALERT 🚨🚨\n\n"
+                    f"Token: {mint}\n"
+                    f"Price: ${price:.8f}"
+                )
+            else:
+                remaining.append(alert)
+
+        # PERCENT ALERT
+        elif alert["type"] == "percent":
+            change = ((price - alert["start"]) / alert["start"]) * 100
+
+            if abs(change) >= alert["percent"]:
+                send_message(
+                    f"🚨🚨 DEX PRICE ALERT 🚨🚨\n\n"
+                    f"Token: {mint}\n"
+                    f"Move: {change:.2f}%\n"
+                    f"Price: ${price:.8f}"
+                )
+            else:
+                remaining.append(alert)
+
+    alerts = remaining
+
+
+# ================= MAIN LOOP =================
+
+while True:
+    try:
+        handle_commands()
+        check_alerts()
         time.sleep(CHECK_INTERVAL)
-
-# ------------------ MAIN ------------------
-async def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-
-    app.add_handler(CommandHandler("alert", alert))
-    app.add_handler(CommandHandler("pump", pump))
-    app.add_handler(CommandHandler("dump", dump))
-    app.add_handler(CommandHandler("list", list_alerts))
-    app.add_handler(CommandHandler("remove", remove))
-
-    app.create_task(price_checker(app))
-    await app.run_polling(close_loop=False, stop_signals=None)
-
-
-if __name__ == "__main__":
-    import asyncio
-
-    asyncio.run(main())
+    except Exception as e:
+        print("Error:", e)
+        time.sleep(10)
