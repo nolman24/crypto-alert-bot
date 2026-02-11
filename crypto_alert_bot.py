@@ -175,7 +175,7 @@ def handle_commands():
                 send_message("❌ No matching price alert found")
                 continue
             alerts[:] = [a for a in alerts if a not in removed]
-            send_message(f"✅ Price alert for {token} at ${target} removed")
+            send_message(f"✅ Price alert for {token} at {format_price(target)} removed")
 
         # ===== Delete Percent Alert =====
         elif cmd == "/deletepercent" and len(parts) == 3:
@@ -208,7 +208,7 @@ def handle_commands():
                 msg = "📊 Active Alerts:\n\n"
                 for i, a in enumerate(alerts, 1):
                     if a["type"] == "price":
-                        msg += f"{i}. {a['name']} ({a['symbol']}) - Price: {a['target']} [{a['chain']}]\n"
+                        msg += f"{i}. {a['name']} ({a['symbol']}) - Price: {format_price(a['target'])} [{a['chain']}]\n"
                     else:
                         msg += f"{i}. {a['name']} ({a['symbol']}) - Percent: {a['percent']}% {a['timeframe']} [{a['chain']}]\n"
                 send_message(msg)
@@ -227,13 +227,14 @@ def check_alerts():
         symbol = symbol or alert["mint"][:6]
         chart_url = f"https://dexscreener.com/{alert['chain']}/{alert['mint']}"
         price_str = format_price(price)
+        target_str = format_price(alert.get("target", price))  # format target too
 
         # ===== PRICE ALERT =====
         if alert["type"] == "price":
             if price >= alert["target"]:
                 send_message(
                     f"🚨🚨 DEX PRICE ALERT 🚨🚨\n\n"
-                    f"{name} ({symbol}) went above ${alert['target']}\n\n"
+                    f"{name} ({symbol}) went above {target_str}\n\n"
                     f"Current Price: {price_str}\n"
                     f"Market Cap: {mc}\n\n"
                     f"Change (from DexScreener):\n{format_changes(price_changes)}"
