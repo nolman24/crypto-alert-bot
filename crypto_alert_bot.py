@@ -55,14 +55,14 @@ def get_token_data(chain, mint):
         else:
             mc = "N/A"
         price_changes = pair.get("priceChange") or {}
-        return price, f"{name} ({symbol})", mc, price_changes
+        return price, name, symbol, mc, price_changes
     except:
-        return None, None, None, None
+        return None, None, None, None, None
 
 
 def detect_chain(mint):
     for chain in supported_chains:
-        price, name, mc, price_changes = get_token_data(chain, mint)
+        price, name, symbol, mc, price_changes = get_token_data(chain, mint)
         if price:
             return chain
     return None
@@ -97,12 +97,12 @@ def handle_commands():
             else:
                 send_message("Usage: /add [chain] <mint> <target>")
                 continue
-            price, name, mc, _ = get_token_data(chain, mint)
+            price, name, symbol, mc, _ = get_token_data(chain, mint)
             if price is None:
                 send_message("❌ Token not found")
                 continue
-            alerts.append({"type": "price", "chain": chain, "mint": mint, "target": target, "name": name})
-            send_message(f"✅ Price alert added for {name}")
+            alerts.append({"type": "price", "chain": chain, "mint": mint, "target": target, "name": name, "symbol": symbol})
+            send_message(f"✅ Price alert added for {name} ({symbol})")
 
         # ===== Add Percent Alert =====
         elif cmd == "/percent":
@@ -125,7 +125,7 @@ def handle_commands():
             if timeframe not in TIMEFRAME_MAP:
                 send_message("❌ Timeframe must be one of: 5m, 1h, 6h, 24h")
                 continue
-            price, name, mc, price_changes = get_token_data(chain, mint)
+            price, name, symbol, mc, price_changes = get_token_data(chain, mint)
             if price is None:
                 send_message("❌ Token not found")
                 continue
@@ -135,15 +135,16 @@ def handle_commands():
                 "mint": mint,
                 "percent": percent,
                 "timeframe": timeframe,
-                "name": name
+                "name": name,
+                "symbol": symbol
             })
-            send_message(f"✅ Percent alert added for {name} ({percent}% over {timeframe})")
+            send_message(f"✅ Percent alert added for {name} ({symbol}) ({percent}% over {timeframe})")
 
         # ===== Delete Price Alert =====
         elif cmd == "/deleteprice" and len(parts) == 3:
             token = parts[1]
             target = float(parts[2])
-            removed = [a for a in alerts if a["type"] == "price" and (a["mint"] == token or a["name"].split()[0] == token) and a["target"] == target]
+            removed = [a for a in alerts if a["type"] == "price" and (a["mint"] == token or a["symbol"] == token) and a["target"] == target]
             if not removed:
                 send_message("❌ No matching price alert found")
                 continue
@@ -154,7 +155,7 @@ def handle_commands():
         elif cmd == "/deletepercent" and len(parts) == 3:
             token = parts[1]
             percent = float(parts[2])
-            removed = [a for a in alerts if a["type"] == "percent" and (a["mint"] == token or a["name"].split()[0] == token) and a["percent"] == percent]
+            removed = [a for a in alerts if a["type"] == "percent" and (a["mint"] == token or a["symbol"] == token) and a["percent"] == percent]
             if not removed:
                 send_message("❌ No matching percent alert found")
                 continue
@@ -169,9 +170,9 @@ def handle_commands():
                 msg = "📊 Active Alerts:\n\n"
                 for a in alerts:
                     if a["type"] == "price":
-                        msg += f"{a['name']} (Price: ${a['target']}) [{a['chain']}]\n"
+                        msg += f"{a['name']} ({a['symbol']}) - Price: ${a['target']} [{a['chain']}]\n"
                     else:
-                        msg += f"{a['name']} (Percent: {a['percent']}% {a['timeframe']}) [{a['chain']}]\n"
+                        msg += f"{a['name']} ({a['symbol']}) - Percent: {a['percent']}% {a['timeframe']} [{a['chain']}]\n"
                 send_message(msg)
 
 
@@ -180,7 +181,7 @@ def check_alerts():
     global alerts
     remaining = []
     for alert in alerts:
-        price, name, mc, price_changes = get_token_data(alert["chain"], alert["mint"])
+        price, name, symbol, mc, price_changes = get_token_data(alert["chain"], alert["mint"])
         if price is None:
             remaining.append(alert)
             continue
@@ -191,7 +192,7 @@ def check_alerts():
             if price >= alert["target"]:
                 send_message(
                     f"🚨🚨 DEX PRICE ALERT 🚨🚨\n\n"
-                    f"{alert['name']} went above ${alert['target']}\n\n"
+                    f"{name} ({symbol}) went above ${alert['target']}\n\n"
                     f"Current Price: ${price:.8f}\n"
                     f"Market Cap: {mc}\n\n"
                     f"Change (from DexScreener):\n"
@@ -218,7 +219,7 @@ def check_alerts():
             if pct_change >= alert["percent"]:
                 send_message(
                     f"🚨🚨 DEX PRICE ALERT 🚨🚨\n\n"
-                    f"{alert['name']} moved +{pct_change:.2f}% over {alert['timeframe']}\n\n"
+                    f"{name} ({symbol}) moved +{pct_change:.2f}% over {alert['timeframe']}\n\n"
                     f"Current Price: ${price:.8f}\n"
                     f"Market Cap: {mc}\n\n"
                     f"Change (from DexScreener):\n"
