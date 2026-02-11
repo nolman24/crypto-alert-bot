@@ -1,16 +1,15 @@
 import requests
 import time
+import json
+import os
 
 BOT_TOKEN = "8469965625:AAFSvsOKpijGV7A78yrtvQ4Hr7Dby3ulRzs"
 CHAT_ID = "664435400"
 
 CHECK_INTERVAL = 10  # seconds
-alerts = []
-last_update_id = None
+ALERTS_FILE = "alerts.json"
 
 supported_chains = ["solana", "ethereum", "bsc", "polygon", "avalanche", "fantom"]
-
-# Mapping for DexScreener keys
 TIMEFRAME_MAP = {
     "5m": "m5",
     "1h": "h1",
@@ -18,12 +17,22 @@ TIMEFRAME_MAP = {
     "24h": "d1"
 }
 
+# ================= LOAD/ SAVE ALERTS =================
+try:
+    with open(ALERTS_FILE, "r") as f:
+        alerts = json.load(f)
+except FileNotFoundError:
+    alerts = []
+
+def save_alerts():
+    with open(ALERTS_FILE, "w") as f:
+        json.dump(alerts, f)
 
 # ================= TELEGRAM =================
+last_update_id = None
 def send_message(text):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     requests.post(url, data={"chat_id": CHAT_ID, "text": text})
-
 
 def get_updates():
     global last_update_id
@@ -35,7 +44,6 @@ def get_updates():
     if res["result"]:
         last_update_id = res["result"][-1]["update_id"]
     return res["result"]
-
 
 # ================= TOKEN DATA =================
 def get_token_data(chain, mint):
@@ -59,14 +67,12 @@ def get_token_data(chain, mint):
     except:
         return None, None, None, None, None
 
-
 def detect_chain(mint):
     for chain in supported_chains:
         price, name, symbol, mc, price_changes = get_token_data(chain, mint)
         if price:
             return chain
     return None
-
 
 # ================= FORMAT CHANGES =================
 def format_changes(price_changes):
@@ -81,14 +87,11 @@ def format_changes(price_changes):
             display += f"{names[key]}: N/A\n"
     return display
 
-
 def format_price(price):
     if price >= 0.0001:
         return f"${price:.8f}"
     else:
-        # Show up to 12 decimals for very small prices, remove trailing zeros
         return f"${price:.12f}".rstrip("0").rstrip(".")
-
 
 # ================= COMMAND HANDLER =================
 def handle_commands():
@@ -105,7 +108,7 @@ def handle_commands():
 
         # ===== Add Price Alert =====
         if cmd == "/add":
-            if len(parts) == 2 or len(parts) == 3:  # auto-detect chain
+            if len(parts) == 2 or len(parts) == 3:
                 mint = parts[1]
                 target = float(parts[2])
                 chain = detect_chain(mint)
@@ -126,11 +129,12 @@ def handle_commands():
             name = name or mint
             symbol = symbol or mint[:6]
             alerts.append({"type": "price", "chain": chain, "mint": mint, "target": target, "name": name, "symbol": symbol})
+            save_alerts()
             send_message(f"✅ Price alert added for {name} ({symbol})")
 
         # ===== Add Percent Alert =====
         elif cmd == "/percent":
-            if len(parts) == 4:  # auto-detect chain
+            if len(parts) == 4:
                 mint = parts[1]
                 percent = float(parts[2])
                 timeframe = parts[3]
@@ -164,6 +168,7 @@ def handle_commands():
                 "name": name,
                 "symbol": symbol
             })
+            save_alerts()
             send_message(f"✅ Percent alert added for {name} ({symbol}) ({percent}% over {timeframe})")
 
         # ===== Delete Price Alert =====
@@ -175,6 +180,7 @@ def handle_commands():
                 send_message("❌ No matching price alert found")
                 continue
             alerts[:] = [a for a in alerts if a not in removed]
+            save_alerts()
             send_message(f"✅ Price alert for {token} at {format_price(target)} removed")
 
         # ===== Delete Percent Alert =====
@@ -186,6 +192,7 @@ def handle_commands():
                 send_message("❌ No matching percent alert found")
                 continue
             alerts[:] = [a for a in alerts if a not in removed]
+            save_alerts()
             send_message(f"✅ Percent alert for {token} at {percent}% removed")
 
         # ===== Delete by Number =====
@@ -194,6 +201,7 @@ def handle_commands():
                 idx = int(parts[1]) - 1
                 if 0 <= idx < len(alerts):
                     removed = alerts.pop(idx)
+                    save_alerts()
                     send_message(f"✅ Alert #{parts[1]} ({removed['name']} {removed['symbol']}) deleted")
                 else:
                     send_message("❌ Invalid alert number")
@@ -213,6 +221,46 @@ def handle_commands():
                         msg += f"{i}. {a['name']} ({a['symbol']}) - Percent: {a['percent']}% {a['timeframe']} [{a['chain']}]\n"
                 send_message(msg)
 
+# ================= CATCH-UP FOR MISSED ALERTS =================
+def catch_up_alerts():
+    global alerts
+    for alert in alerts:
+        price, name, symbol, mc, price_changes = get_token_data(alert["chain"], alert["mint"])
+        if price is None:
+            continue
+        name = name or alert["mint"]
+        symbol = symbol or alert["mint"][:6]
+        chart_url = f"https://dexscreener.com/{alert['chain']}/{alert['mint']}"
+        price_str = format_price(price)
+        target_str = format_price(alert.get("target", price))
+
+        if alert["type"] == "price" and price >= alert["target"]:
+            send_message(
+                f"🚨🚨 DEX PRICE ALERT 🚨🚨\n\n"
+                f"{name} ({symbol}) went above {target_str} (triggered while bot offline)\n\n"
+                f"Current Price: {price_str}\n"
+                f"Market Cap: {mc}\n\n"
+                f"Change (from DexScreener):\n{format_changes(price_changes)}"
+                f"📈 Chart: {chart_url}"
+            )
+
+        elif alert["type"] == "percent":
+            key = TIMEFRAME_MAP.get(alert["timeframe"])
+            if key:
+                pct_change = price_changes.get(key)
+                if pct_change is not None and pct_change >= alert["percent"]:
+                    send_message(
+                        f"🚨🚨 DEX PRICE ALERT 🚨🚨\n\n"
+                        f"{name} ({symbol}) moved +{pct_change:.2f}% over {alert['timeframe']} "
+                        f"(triggered while bot offline)\n\n"
+                        f"Current Price: {price_str}\n"
+                        f"Market Cap: {mc}\n\n"
+                        f"Change (from DexScreener):\n{format_changes(price_changes)}"
+                        f"📈 Chart: {chart_url}"
+                    )
+
+# Catch up on any alerts missed during downtime
+catch_up_alerts()
 
 # ================= ALERT CHECKER =================
 def check_alerts():
@@ -227,7 +275,7 @@ def check_alerts():
         symbol = symbol or alert["mint"][:6]
         chart_url = f"https://dexscreener.com/{alert['chain']}/{alert['mint']}"
         price_str = format_price(price)
-        target_str = format_price(alert.get("target", price))  # format target too
+        target_str = format_price(alert.get("target", price))
 
         # ===== PRICE ALERT =====
         if alert["type"] == "price":
@@ -253,7 +301,7 @@ def check_alerts():
             if pct_change is None:
                 remaining.append(alert)
                 continue
-            if pct_change >= alert["percent"]:  # Only positive increases
+            if pct_change >= alert["percent"]:
                 send_message(
                     f"🚨🚨 DEX PRICE ALERT 🚨🚨\n\n"
                     f"{name} ({symbol}) moved +{pct_change:.2f}% over {alert['timeframe']}\n\n"
@@ -266,7 +314,7 @@ def check_alerts():
                 remaining.append(alert)
 
     alerts = remaining
-
+    save_alerts()
 
 # ================= MAIN LOOP =================
 while True:
