@@ -47,8 +47,8 @@ def get_token_data(chain, mint):
             return None, None, None, None, None
         pair = pairs[0]
         price = float(pair["priceUsd"])
-        name = pair["baseToken"]["name"]
-        symbol = pair["baseToken"]["symbol"]
+        name = pair["baseToken"].get("name") or None
+        symbol = pair["baseToken"].get("symbol") or None
         mc = pair.get("marketCap") or pair.get("fdv")
         if mc:
             mc = f"${int(mc):,}"
@@ -80,6 +80,14 @@ def format_changes(price_changes):
         else:
             display += f"{names[key]}: N/A\n"
     return display
+
+
+def format_price(price):
+    if price >= 0.0001:
+        return f"${price:.8f}"
+    else:
+        # Show up to 12 decimals for very small prices, remove trailing zeros
+        return f"${price:.12f}".rstrip("0").rstrip(".")
 
 
 # ================= COMMAND HANDLER =================
@@ -115,6 +123,8 @@ def handle_commands():
             if price is None:
                 send_message("❌ Token not found")
                 continue
+            name = name or mint
+            symbol = symbol or mint[:6]
             alerts.append({"type": "price", "chain": chain, "mint": mint, "target": target, "name": name, "symbol": symbol})
             send_message(f"✅ Price alert added for {name} ({symbol})")
 
@@ -143,6 +153,8 @@ def handle_commands():
             if price is None:
                 send_message("❌ Token not found")
                 continue
+            name = name or mint
+            symbol = symbol or mint[:6]
             alerts.append({
                 "type": "percent",
                 "chain": chain,
@@ -196,7 +208,7 @@ def handle_commands():
                 msg = "📊 Active Alerts:\n\n"
                 for i, a in enumerate(alerts, 1):
                     if a["type"] == "price":
-                        msg += f"{i}. {a['name']} ({a['symbol']}) - Price: ${a['target']} [{a['chain']}]\n"
+                        msg += f"{i}. {a['name']} ({a['symbol']}) - Price: {a['target']} [{a['chain']}]\n"
                     else:
                         msg += f"{i}. {a['name']} ({a['symbol']}) - Percent: {a['percent']}% {a['timeframe']} [{a['chain']}]\n"
                 send_message(msg)
@@ -211,17 +223,20 @@ def check_alerts():
         if price is None:
             remaining.append(alert)
             continue
+        name = name or alert["mint"]
+        symbol = symbol or alert["mint"][:6]
         chart_url = f"https://dexscreener.com/{alert['chain']}/{alert['mint']}"
+        price_str = format_price(price)
 
         # ===== PRICE ALERT =====
         if alert["type"] == "price":
             if price >= alert["target"]:
                 send_message(
                     f"🚨🚨 DEX PRICE ALERT 🚨🚨\n\n"
-                    f"{alert['name']} ({alert['symbol']}) went above ${alert['target']}\n\n"
-                    f"Current Price: ${price:.8f}\n"
+                    f"{name} ({symbol}) went above ${alert['target']}\n\n"
+                    f"Current Price: {price_str}\n"
                     f"Market Cap: {mc}\n\n"
-                    f"Change (from DexScreener):\n{format_changes(price_changes)}\n"
+                    f"Change (from DexScreener):\n{format_changes(price_changes)}"
                     f"📈 Chart: {chart_url}"
                 )
             else:
@@ -237,14 +252,13 @@ def check_alerts():
             if pct_change is None:
                 remaining.append(alert)
                 continue
-            # Only trigger on positive increase
-            if pct_change >= alert["percent"]:
+            if pct_change >= alert["percent"]:  # Only positive increases
                 send_message(
                     f"🚨🚨 DEX PRICE ALERT 🚨🚨\n\n"
-                    f"{alert['name']} ({alert['symbol']}) moved +{pct_change:.2f}% over {alert['timeframe']}\n\n"
-                    f"Current Price: ${price:.8f}\n"
+                    f"{name} ({symbol}) moved +{pct_change:.2f}% over {alert['timeframe']}\n\n"
+                    f"Current Price: {price_str}\n"
                     f"Market Cap: {mc}\n\n"
-                    f"Change (from DexScreener):\n{format_changes(price_changes)}\n"
+                    f"Change (from DexScreener):\n{format_changes(price_changes)}"
                     f"📈 Chart: {chart_url}"
                 )
             else:
