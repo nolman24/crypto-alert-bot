@@ -209,8 +209,10 @@ async def main():
     app.add_handler(CommandHandler("remove", remove))
 
     app.create_task(price_checker(app))
-    await app.run_polling()
+    await app.run_polling(close_loop=False, stop_signals=None)
+
 
 if __name__ == "__main__":
     import asyncio
+
     asyncio.run(main())
