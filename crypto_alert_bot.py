@@ -12,10 +12,13 @@ ALERTS_FILE = "alerts.json"
 POLL_INTERVAL = 10  # seconds
 
 # ------------------------
-# HELPER FUNCTIONS
+# GLOBAL VARIABLES
 # ------------------------
 alerts = {}  # {chat_id: [alert_dicts]}
 
+# ------------------------
+# HELPER FUNCTIONS
+# ------------------------
 def load_alerts():
     global alerts
     try:
@@ -25,10 +28,14 @@ def load_alerts():
         alerts = {}
 
 def save_alerts():
-    with open(ALERTS_FILE, "w") as f:
-        json.dump(alerts, f, indent=2)
+    try:
+        with open(ALERTS_FILE, "w") as f:
+            json.dump(alerts, f, indent=2)
+    except Exception as e:
+        print("Error saving alerts:", e)
 
 def format_price(price):
+    # Prevent scientific notation
     if price < 0.0001:
         return f"{price:.8f}"
     else:
@@ -202,20 +209,20 @@ async def price_polling_task(app):
     while True:
         try:
             for chat_id, user_alerts in alerts.items():
-                for alert in user_alerts.copy():  # iterate copy to safely remove
-                    token_data = await fetch_token_data(alert["contract"])
-                    if not token_data or not token_data.get("pairs"):
-                        continue
+                for alert in user_alerts.copy():
+                    try:
+                        token_data = await fetch_token_data(alert["contract"])
+                        if not token_data or not token_data.get("pairs"):
+                            continue
 
-                    pair = token_data["pairs"][0]
-                    current_price = float(pair.get("priceUsd", 0))
-                    market_cap = float(pair.get("marketCap", 0))
-                    token_name = pair["baseToken"].get("name", "Unknown")
-                    symbol = pair["baseToken"].get("symbol", "UNK")
+                        pair = token_data["pairs"][0]
+                        current_price = float(pair.get("priceUsd", 0))
+                        market_cap = float(pair.get("marketCap", 0))
+                        token_name = pair["baseToken"].get("name", "Unknown")
+                        symbol = pair["baseToken"].get("symbol", "UNK")
 
-                    # Price Alert
-                    if alert["type"] == "price":
-                        if current_price >= alert["value"]:
+                        # Price Alert
+                        if alert["type"] == "price" and current_price >= alert["value"]:
                             text = (
                                 f"{token_name} ({symbol}) went above ${format_price(alert['value'])}\n"
                                 f"Current Price: ${format_price(current_price)}\n"
@@ -224,25 +231,28 @@ async def price_polling_task(app):
                             await app.bot.send_message(chat_id=int(chat_id), text=text)
                             user_alerts.remove(alert)
                             save_alerts()
-                    # Percent Change Alert
-                    elif alert["type"] == "percent":
-                        timeframe = alert.get("timeframe", "1h")
-                        change_key = {
-                            "5m": "priceChange5m",
-                            "1h": "priceChange1h",
-                            "6h": "priceChange6h",
-                            "24h": "priceChange24h"
-                        }.get(timeframe, "priceChange1h")
-                        percent_change = float(pair.get(change_key, 0))
-                        if percent_change >= alert["value"]:
-                            text = (
-                                f"{token_name} ({symbol}) price increased by {percent_change:.2f}% over {timeframe}\n"
-                                f"Current Price: ${format_price(current_price)}\n"
-                                f"Market Cap: ${market_cap:,.0f}"
-                            )
-                            await app.bot.send_message(chat_id=int(chat_id), text=text)
-                            user_alerts.remove(alert)
-                            save_alerts()
+
+                        # Percent Change Alert
+                        elif alert["type"] == "percent":
+                            timeframe = alert.get("timeframe", "1h")
+                            change_key = {
+                                "5m": "priceChange5m",
+                                "1h": "priceChange1h",
+                                "6h": "priceChange6h",
+                                "24h": "priceChange24h"
+                            }.get(timeframe, "priceChange1h")
+                            percent_change = float(pair.get(change_key, 0))
+                            if percent_change >= alert["value"]:
+                                text = (
+                                    f"{token_name} ({symbol}) price increased by {percent_change:.2f}% over {timeframe}\n"
+                                    f"Current Price: ${format_price(current_price)}\n"
+                                    f"Market Cap: ${market_cap:,.0f}"
+                                )
+                                await app.bot.send_message(chat_id=int(chat_id), text=text)
+                                user_alerts.remove(alert)
+                                save_alerts()
+                    except Exception as e:
+                        print(f"Error processing alert for {alert.get('contract','unknown')}: {e}")
         except Exception as e:
             print("Error in polling task:", e)
         await asyncio.sleep(POLL_INTERVAL)
