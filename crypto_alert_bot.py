@@ -1,327 +1,247 @@
-import requests
-import time
+import asyncio
 import json
-import os
+import aiohttp
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
+# ------------------------
+# CONFIGURATION
+# ------------------------
 BOT_TOKEN = "8469965625:AAFSvsOKpijGV7A78yrtvQ4Hr7Dby3ulRzs"
-CHAT_ID = "664435400"
-
-CHECK_INTERVAL = 10  # seconds
 ALERTS_FILE = "alerts.json"
+POLL_INTERVAL = 10  # seconds
 
-supported_chains = ["solana", "ethereum", "bsc", "polygon", "avalanche", "fantom"]
-TIMEFRAME_MAP = {
-    "5m": "m5",
-    "1h": "h1",
-    "6h": "h6",
-    "24h": "d1"
-}
+# ------------------------
+# HELPER FUNCTIONS
+# ------------------------
+alerts = {}  # {chat_id: [alert_dicts]}
 
-# ================= LOAD/ SAVE ALERTS =================
-try:
-    with open(ALERTS_FILE, "r") as f:
-        alerts = json.load(f)
-except FileNotFoundError:
-    alerts = []
+def load_alerts():
+    global alerts
+    try:
+        with open(ALERTS_FILE, "r") as f:
+            alerts = json.load(f)
+    except:
+        alerts = {}
 
 def save_alerts():
     with open(ALERTS_FILE, "w") as f:
-        json.dump(alerts, f)
-
-# ================= TELEGRAM =================
-last_update_id = None
-def send_message(text):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    requests.post(url, data={"chat_id": CHAT_ID, "text": text})
-
-def get_updates():
-    global last_update_id
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
-    params = {"timeout": 100}
-    if last_update_id:
-        params["offset"] = last_update_id + 1
-    res = requests.get(url, params=params).json()
-    if res["result"]:
-        last_update_id = res["result"][-1]["update_id"]
-    return res["result"]
-
-# ================= TOKEN DATA =================
-def get_token_data(chain, mint):
-    try:
-        url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
-        data = requests.get(url, timeout=10).json()
-        pairs = data.get("pairs")
-        if not pairs:
-            return None, None, None, None, None
-        pair = pairs[0]
-        price = float(pair["priceUsd"])
-        name = pair["baseToken"].get("name") or None
-        symbol = pair["baseToken"].get("symbol") or None
-        mc = pair.get("marketCap") or pair.get("fdv")
-        if mc:
-            mc = f"${int(mc):,}"
-        else:
-            mc = "N/A"
-        price_changes = pair.get("priceChange") or {}
-        return price, name, symbol, mc, price_changes
-    except:
-        return None, None, None, None, None
-
-def detect_chain(mint):
-    for chain in supported_chains:
-        price, name, symbol, mc, price_changes = get_token_data(chain, mint)
-        if price:
-            return chain
-    return None
-
-# ================= FORMAT CHANGES =================
-def format_changes(price_changes):
-    intervals = ["m5", "h1", "h6", "d1"]
-    names = {"m5": "5 min", "h1": "1 hr", "h6": "6 hr", "d1": "24 hr"}
-    display = ""
-    for key in intervals:
-        pct = price_changes.get(key)
-        if pct is not None:
-            display += f"{names[key]}: {pct:.2f}%\n"
-        else:
-            display += f"{names[key]}: N/A\n"
-    return display
+        json.dump(alerts, f, indent=2)
 
 def format_price(price):
-    if price >= 0.0001:
-        return f"${price:.8f}"
+    # prevent scientific notation
+    if price < 0.0001:
+        return f"{price:.8f}"
     else:
-        return f"${price:.12f}".rstrip("0").rstrip(".")
+        return f"{price:.6f}"
 
-# ================= COMMAND HANDLER =================
-def handle_commands():
-    global alerts
-    updates = get_updates()
-    for update in updates:
-        if "message" not in update:
-            continue
-        text = update["message"].get("text", "")
-        parts = text.split()
-        if not parts:
-            continue
-        cmd = parts[0].lower()
-
-        # ===== Add Price Alert =====
-        if cmd == "/add":
-            if len(parts) == 2 or len(parts) == 3:
-                mint = parts[1]
-                target = float(parts[2])
-                chain = detect_chain(mint)
-                if not chain:
-                    send_message("❌ Token not found on any supported chain")
-                    continue
-            elif len(parts) == 4:
-                chain = parts[1].lower()
-                mint = parts[2]
-                target = float(parts[3])
+async def fetch_token_data(contract):
+    url = f"https://api.dexscreener.com/latest/dex/tokens/{contract}"
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url) as resp:
+            if resp.status == 200:
+                return await resp.json()
             else:
-                send_message("Usage: /add [chain] <mint> <target>")
-                continue
-            price, name, symbol, mc, _ = get_token_data(chain, mint)
-            if price is None:
-                send_message("❌ Token not found")
-                continue
-            name = name or mint
-            symbol = symbol or mint[:6]
-            alerts.append({"type": "price", "chain": chain, "mint": mint, "target": target, "name": name, "symbol": symbol})
-            save_alerts()
-            send_message(f"✅ Price alert added for {name} ({symbol})")
+                return None
 
-        # ===== Add Percent Alert =====
-        elif cmd == "/percent":
-            if len(parts) == 4:
-                mint = parts[1]
-                percent = float(parts[2])
-                timeframe = parts[3]
-                chain = detect_chain(mint)
-                if not chain:
-                    send_message("❌ Token not found on any supported chain")
-                    continue
-            elif len(parts) == 5:
-                chain = parts[1].lower()
-                mint = parts[2]
-                percent = float(parts[3])
-                timeframe = parts[4]
-            else:
-                send_message("Usage: /percent [chain] <mint> <percent> <timeframe>")
-                continue
-            if timeframe not in TIMEFRAME_MAP:
-                send_message("❌ Timeframe must be one of: 5m, 1h, 6h, 24h")
-                continue
-            price, name, symbol, mc, price_changes = get_token_data(chain, mint)
-            if price is None:
-                send_message("❌ Token not found")
-                continue
-            name = name or mint
-            symbol = symbol or mint[:6]
-            alerts.append({
-                "type": "percent",
-                "chain": chain,
-                "mint": mint,
-                "percent": percent,
-                "timeframe": timeframe,
-                "name": name,
-                "symbol": symbol
-            })
-            save_alerts()
-            send_message(f"✅ Percent alert added for {name} ({symbol}) ({percent}% over {timeframe})")
+# ------------------------
+# COMMAND HANDLERS
+# ------------------------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Welcome! Use /add to create alerts, /list to see them.")
 
-        # ===== Delete Price Alert =====
-        elif cmd == "/deleteprice" and len(parts) == 3:
-            token = parts[1]
-            target = float(parts[2])
-            removed = [a for a in alerts if a["type"] == "price" and (a["mint"] == token or a["symbol"] == token) and a["target"] == target]
-            if not removed:
-                send_message("❌ No matching price alert found")
-                continue
-            alerts[:] = [a for a in alerts if a not in removed]
-            save_alerts()
-            send_message(f"✅ Price alert for {token} at {format_price(target)} removed")
+# Add command could be more advanced; for simplicity here, just a placeholder
+async def add_alert(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Expects: /add <contract> <price or %> <type>
+    try:
+        args = context.args
+        contract = args[0]
+        value = float(args[1])
+        alert_type = args[2].lower()  # 'price' or 'percent'
+        chat_id = str(update.effective_chat.id)
 
-        # ===== Delete Percent Alert =====
-        elif cmd == "/deletepercent" and len(parts) == 3:
-            token = parts[1]
-            percent = float(parts[2])
-            removed = [a for a in alerts if a["type"] == "percent" and (a["mint"] == token or a["symbol"] == token) and a["percent"] == percent]
-            if not removed:
-                send_message("❌ No matching percent alert found")
-                continue
-            alerts[:] = [a for a in alerts if a not in removed]
-            save_alerts()
-            send_message(f"✅ Percent alert for {token} at {percent}% removed")
+        token_data = await fetch_token_data(contract)
+        if not token_data:
+            await update.message.reply_text("Could not fetch token data.")
+            return
 
-        # ===== Delete by Number =====
-        elif cmd == "/delete" and len(parts) == 2:
-            try:
-                idx = int(parts[1]) - 1
-                if 0 <= idx < len(alerts):
-                    removed = alerts.pop(idx)
-                    save_alerts()
-                    send_message(f"✅ Alert #{parts[1]} ({removed['name']} {removed['symbol']}) deleted")
-                else:
-                    send_message("❌ Invalid alert number")
-            except ValueError:
-                send_message("❌ Please enter a valid number")
+        token_name = token_data["pairs"][0]["baseToken"]["name"]
+        symbol = token_data["pairs"][0]["baseToken"]["symbol"]
 
-        # ===== List Alerts =====
-        elif cmd == "/list":
-            if not alerts:
-                send_message("No active alerts")
-            else:
-                msg = "📊 Active Alerts:\n\n"
-                for i, a in enumerate(alerts, 1):
-                    if a["type"] == "price":
-                        msg += f"{i}. {a['name']} ({a['symbol']}) - Price: {format_price(a['target'])} [{a['chain']}]\n"
-                    else:
-                        msg += f"{i}. {a['name']} ({a['symbol']}) - Percent: {a['percent']}% {a['timeframe']} [{a['chain']}]\n"
-                send_message(msg)
+        alert = {
+            "contract": contract,
+            "value": value,
+            "type": alert_type,
+            "token_name": token_name,
+            "symbol": symbol
+        }
 
-# ================= CATCH-UP FOR MISSED ALERTS =================
-def catch_up_alerts():
-    global alerts
-    for alert in alerts:
-        price, name, symbol, mc, price_changes = get_token_data(alert["chain"], alert["mint"])
-        if price is None:
-            continue
-        name = name or alert["mint"]
-        symbol = symbol or alert["mint"][:6]
-        chart_url = f"https://dexscreener.com/{alert['chain']}/{alert['mint']}"
-        price_str = format_price(price)
-        target_str = format_price(alert.get("target", price))
+        if chat_id not in alerts:
+            alerts[chat_id] = []
+        alerts[chat_id].append(alert)
+        save_alerts()
+        await update.message.reply_text(f"✅ Alert added for {token_name} ({symbol})")
+    except Exception as e:
+        await update.message.reply_text(f"Error adding alert: {e}")
 
-        if alert["type"] == "price" and price >= alert["target"]:
-            send_message(
-                f"🚨🚨 DEX PRICE ALERT 🚨🚨\n\n"
-                f"{name} ({symbol}) went above {target_str} (triggered while bot offline)\n\n"
-                f"Current Price: {price_str}\n"
-                f"Market Cap: {mc}\n\n"
-                f"Change (from DexScreener):\n{format_changes(price_changes)}"
-                f"📈 Chart: {chart_url}"
-            )
+# ------------------------
+# LIST WITH INLINE BUTTONS
+# ------------------------
+async def list_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = str(update.effective_chat.id)
 
-        elif alert["type"] == "percent":
-            key = TIMEFRAME_MAP.get(alert["timeframe"])
-            if key:
-                pct_change = price_changes.get(key)
-                if pct_change is not None and pct_change >= alert["percent"]:
-                    send_message(
-                        f"🚨🚨 DEX PRICE ALERT 🚨🚨\n\n"
-                        f"{name} ({symbol}) moved +{pct_change:.2f}% over {alert['timeframe']} "
-                        f"(triggered while bot offline)\n\n"
-                        f"Current Price: {price_str}\n"
-                        f"Market Cap: {mc}\n\n"
-                        f"Change (from DexScreener):\n{format_changes(price_changes)}"
-                        f"📈 Chart: {chart_url}"
-                    )
+    if chat_id not in alerts or not alerts[chat_id]:
+        await update.message.reply_text("No active alerts.")
+        return
 
-# Catch up on any alerts missed during downtime
-catch_up_alerts()
+    for i, alert in enumerate(alerts[chat_id], start=1):
+        token = alert["token_name"]
+        symbol = alert["symbol"]
+        value = alert["value"]
+        alert_type = alert["type"]
 
-# ================= ALERT CHECKER =================
-def check_alerts():
-    global alerts
-    remaining = []
-    for alert in alerts:
-        price, name, symbol, mc, price_changes = get_token_data(alert["chain"], alert["mint"])
-        if price is None:
-            remaining.append(alert)
-            continue
-        name = name or alert["mint"]
-        symbol = symbol or alert["mint"][:6]
-        chart_url = f"https://dexscreener.com/{alert['chain']}/{alert['mint']}"
-        price_str = format_price(price)
-        target_str = format_price(alert.get("target", price))
+        if alert_type == "price":
+            text = f"{i}. {token} ({symbol})\nPrice Alert: ${format_price(value)}"
+        else:
+            text = f"{i}. {token} ({symbol})\n% Change Alert: {value}%"
 
-        # ===== PRICE ALERT =====
-        if alert["type"] == "price":
-            if price >= alert["target"]:
-                send_message(
-                    f"🚨🚨 DEX PRICE ALERT 🚨🚨\n\n"
-                    f"{name} ({symbol}) went above {target_str}\n\n"
-                    f"Current Price: {price_str}\n"
-                    f"Market Cap: {mc}\n\n"
-                    f"Change (from DexScreener):\n{format_changes(price_changes)}"
-                    f"📈 Chart: {chart_url}"
-                )
-            else:
-                remaining.append(alert)
+        keyboard = [
+            [
+                InlineKeyboardButton("✏️ Edit Price", callback_data=f"edit_price_{i-1}"),
+                InlineKeyboardButton("📈 Edit %", callback_data=f"edit_percent_{i-1}")
+            ],
+            [
+                InlineKeyboardButton("🗑 Delete", callback_data=f"delete_{i-1}")
+            ]
+        ]
 
-        # ===== PERCENT ALERT =====
-        elif alert["type"] == "percent":
-            key = TIMEFRAME_MAP.get(alert["timeframe"])
-            if not key:
-                remaining.append(alert)
-                continue
-            pct_change = price_changes.get(key)
-            if pct_change is None:
-                remaining.append(alert)
-                continue
-            if pct_change >= alert["percent"]:
-                send_message(
-                    f"🚨🚨 DEX PRICE ALERT 🚨🚨\n\n"
-                    f"{name} ({symbol}) moved +{pct_change:.2f}% over {alert['timeframe']}\n\n"
-                    f"Current Price: {price_str}\n"
-                    f"Market Cap: {mc}\n\n"
-                    f"Change (from DexScreener):\n{format_changes(price_changes)}"
-                    f"📈 Chart: {chart_url}"
-                )
-            else:
-                remaining.append(alert)
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text(text, reply_markup=reply_markup)
 
-    alerts = remaining
+# ------------------------
+# BUTTON CALLBACK HANDLER
+# ------------------------
+async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    chat_id = str(query.message.chat.id)
+    data = query.data
+
+    if chat_id not in alerts:
+        return
+
+    parts = data.split("_")
+    action = parts[0]
+    index = int(parts[-1])
+
+    if index >= len(alerts[chat_id]):
+        await query.edit_message_text("Alert not found.")
+        return
+
+    alert = alerts[chat_id][index]
+
+    # DELETE ALERT
+    if action == "delete":
+        alerts[chat_id].pop(index)
+        save_alerts()
+        await query.edit_message_text("✅ Alert deleted.")
+
+    # EDIT PRICE
+    elif action == "edit" and parts[1] == "price":
+        context.user_data["edit_index"] = index
+        context.user_data["edit_type"] = "price"
+        await query.message.reply_text("Send the new trigger price:")
+
+    # EDIT PERCENT
+    elif action == "edit" and parts[1] == "percent":
+        context.user_data["edit_index"] = index
+        context.user_data["edit_type"] = "percent"
+        await query.message.reply_text("Send the new % change trigger:")
+
+# ------------------------
+# HANDLE EDIT RESPONSES
+# ------------------------
+async def handle_edit_response(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if "edit_index" not in context.user_data:
+        return
+
+    chat_id = str(update.effective_chat.id)
+    index = context.user_data["edit_index"]
+    edit_type = context.user_data["edit_type"]
+
+    try:
+        new_value = float(update.message.text)
+    except:
+        await update.message.reply_text("Invalid number.")
+        return
+
+    alerts[chat_id][index]["value"] = new_value
     save_alerts()
 
-# ================= MAIN LOOP =================
-while True:
-    try:
-        handle_commands()
-        check_alerts()
-        time.sleep(CHECK_INTERVAL)
-    except Exception as e:
-        print("Error:", e)
-        time.sleep(10)
+    context.user_data.clear()
+    await update.message.reply_text("✅ Alert updated.")
+
+# ------------------------
+# PRICE POLLING TASK
+# ------------------------
+async def price_polling_task(app):
+    while True:
+        for chat_id, user_alerts in alerts.items():
+            for alert in user_alerts:
+                token_data = await fetch_token_data(alert["contract"])
+                if not token_data:
+                    continue
+
+                pair = token_data["pairs"][0]
+                current_price = float(pair["priceUsd"])
+                market_cap = float(pair.get("marketCap", 0))
+                token_name = pair["baseToken"]["name"]
+                symbol = pair["baseToken"]["symbol"]
+
+                # Price Alert
+                if alert["type"] == "price":
+                    if current_price >= alert["value"]:
+                        text = f"{token_name} ({symbol}) went above ${format_price(alert['value'])}\nCurrent Price: ${format_price(current_price)}\nMarket Cap: ${market_cap:,.0f}"
+                        await app.bot.send_message(chat_id=int(chat_id), text=text)
+                        # Deactivate after trigger
+                        user_alerts.remove(alert)
+                        save_alerts()
+                # Percent Change Alert
+                elif alert["type"] == "percent":
+                    # Dexscreener provides price change percentages
+                    # You can use 5m, 1h, 6h, 24h etc
+                    timeframe = alert.get("timeframe", "1h")  # default 1h
+                    change_key = {"5m":"priceChange5m","1h":"priceChange1h","6h":"priceChange6h","24h":"priceChange24h"}.get(timeframe,"priceChange1h")
+                    percent_change = float(pair.get(change_key,0))
+                    if percent_change >= alert["value"]:
+                        text = f"{token_name} ({symbol}) price increased by {percent_change:.2f}% over {timeframe}\nCurrent Price: ${format_price(current_price)}\nMarket Cap: ${market_cap:,.0f}"
+                        await app.bot.send_message(chat_id=int(chat_id), text=text)
+                        # Deactivate after trigger
+                        user_alerts.remove(alert)
+                        save_alerts()
+        await asyncio.sleep(POLL_INTERVAL)
+
+# ------------------------
+# MAIN FUNCTION
+# ------------------------
+async def main():
+    load_alerts()
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("add", add_alert))
+    app.add_handler(CommandHandler("list", list_alerts))
+    app.add_handler(CallbackQueryHandler(handle_buttons))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_edit_response))
+
+    # Start polling task
+    app.job_queue.run_repeating(lambda _: asyncio.create_task(price_polling_task(app)), interval=POLL_INTERVAL, first=1)
+
+    await app.run_polling()
+
+# ------------------------
+# RUN
+# ------------------------
+if __name__ == "__main__":
+    asyncio.run(main())
