@@ -29,7 +29,6 @@ def save_alerts():
         json.dump(alerts, f, indent=2)
 
 def format_price(price):
-    # prevent scientific notation
     if price < 0.0001:
         return f"{price:.8f}"
     else:
@@ -37,12 +36,17 @@ def format_price(price):
 
 async def fetch_token_data(contract):
     url = f"https://api.dexscreener.com/latest/dex/tokens/{contract}"
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url) as resp:
-            if resp.status == 200:
-                return await resp.json()
-            else:
-                return None
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                else:
+                    print(f"Error fetching {contract}: status {resp.status}")
+                    return None
+    except Exception as e:
+        print(f"Exception fetching {contract}: {e}")
+        return None
 
 # ------------------------
 # COMMAND HANDLERS
@@ -50,23 +54,25 @@ async def fetch_token_data(contract):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Welcome! Use /add to create alerts, /list to see them.")
 
-# Add command could be more advanced; for simplicity here, just a placeholder
 async def add_alert(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Expects: /add <contract> <price or %> <type>
     try:
         args = context.args
+        if len(args) < 3:
+            await update.message.reply_text("Usage: /add <contract> <value> <price|percent>")
+            return
+
         contract = args[0]
         value = float(args[1])
-        alert_type = args[2].lower()  # 'price' or 'percent'
+        alert_type = args[2].lower()
         chat_id = str(update.effective_chat.id)
 
         token_data = await fetch_token_data(contract)
-        if not token_data:
-            await update.message.reply_text("Could not fetch token data.")
+        if not token_data or not token_data.get("pairs"):
+            await update.message.reply_text("Could not fetch token data or no pairs available.")
             return
 
-        token_name = token_data["pairs"][0]["baseToken"]["name"]
-        symbol = token_data["pairs"][0]["baseToken"]["symbol"]
+        token_name = token_data["pairs"][0]["baseToken"].get("name", "Unknown")
+        symbol = token_data["pairs"][0]["baseToken"].get("symbol", "UNK")
 
         alert = {
             "contract": contract,
@@ -95,10 +101,10 @@ async def list_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     for i, alert in enumerate(alerts[chat_id], start=1):
-        token = alert["token_name"]
-        symbol = alert["symbol"]
-        value = alert["value"]
-        alert_type = alert["type"]
+        token = alert.get("token_name", "Unknown")
+        symbol = alert.get("symbol", "UNK")
+        value = alert.get("value", 0)
+        alert_type = alert.get("type", "price")
 
         if alert_type == "price":
             text = f"{i}. {token} ({symbol})\nPrice Alert: ${format_price(value)}"
@@ -129,11 +135,16 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
 
     if chat_id not in alerts:
+        await query.edit_message_text("No alerts found.")
         return
 
-    parts = data.split("_")
-    action = parts[0]
-    index = int(parts[-1])
+    try:
+        parts = data.split("_")
+        action = parts[0]
+        index = int(parts[-1])
+    except:
+        await query.edit_message_text("Invalid callback data.")
+        return
 
     if index >= len(alerts[chat_id]):
         await query.edit_message_text("Alert not found.")
@@ -141,23 +152,22 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     alert = alerts[chat_id][index]
 
-    # DELETE ALERT
-    if action == "delete":
-        alerts[chat_id].pop(index)
-        save_alerts()
-        await query.edit_message_text("✅ Alert deleted.")
-
-    # EDIT PRICE
-    elif action == "edit" and parts[1] == "price":
-        context.user_data["edit_index"] = index
-        context.user_data["edit_type"] = "price"
-        await query.message.reply_text("Send the new trigger price:")
-
-    # EDIT PERCENT
-    elif action == "edit" and parts[1] == "percent":
-        context.user_data["edit_index"] = index
-        context.user_data["edit_type"] = "percent"
-        await query.message.reply_text("Send the new % change trigger:")
+    try:
+        if action == "delete":
+            alerts[chat_id].pop(index)
+            save_alerts()
+            await query.edit_message_text("✅ Alert deleted.")
+        elif action == "edit" and parts[1] == "price":
+            context.user_data["edit_index"] = index
+            context.user_data["edit_type"] = "price"
+            await query.message.reply_text("Send the new trigger price:")
+        elif action == "edit" and parts[1] == "percent":
+            context.user_data["edit_index"] = index
+            context.user_data["edit_type"] = "percent"
+            await query.message.reply_text("Send the new % change trigger:")
+    except Exception as e:
+        print("Error in handle_buttons:", e)
+        await query.edit_message_text("Error processing button click.")
 
 # ------------------------
 # HANDLE EDIT RESPONSES
@@ -170,6 +180,10 @@ async def handle_edit_response(update: Update, context: ContextTypes.DEFAULT_TYP
     index = context.user_data["edit_index"]
     edit_type = context.user_data["edit_type"]
 
+    if chat_id not in alerts or index >= len(alerts[chat_id]):
+        context.user_data.clear()
+        return
+
     try:
         new_value = float(update.message.text)
     except:
@@ -178,7 +192,6 @@ async def handle_edit_response(update: Update, context: ContextTypes.DEFAULT_TYP
 
     alerts[chat_id][index]["value"] = new_value
     save_alerts()
-
     context.user_data.clear()
     await update.message.reply_text("✅ Alert updated.")
 
@@ -187,39 +200,51 @@ async def handle_edit_response(update: Update, context: ContextTypes.DEFAULT_TYP
 # ------------------------
 async def price_polling_task(app):
     while True:
-        for chat_id, user_alerts in alerts.items():
-            for alert in user_alerts:
-                token_data = await fetch_token_data(alert["contract"])
-                if not token_data:
-                    continue
+        try:
+            for chat_id, user_alerts in alerts.items():
+                for alert in user_alerts.copy():  # iterate copy to safely remove
+                    token_data = await fetch_token_data(alert["contract"])
+                    if not token_data or not token_data.get("pairs"):
+                        continue
 
-                pair = token_data["pairs"][0]
-                current_price = float(pair["priceUsd"])
-                market_cap = float(pair.get("marketCap", 0))
-                token_name = pair["baseToken"]["name"]
-                symbol = pair["baseToken"]["symbol"]
+                    pair = token_data["pairs"][0]
+                    current_price = float(pair.get("priceUsd", 0))
+                    market_cap = float(pair.get("marketCap", 0))
+                    token_name = pair["baseToken"].get("name", "Unknown")
+                    symbol = pair["baseToken"].get("symbol", "UNK")
 
-                # Price Alert
-                if alert["type"] == "price":
-                    if current_price >= alert["value"]:
-                        text = f"{token_name} ({symbol}) went above ${format_price(alert['value'])}\nCurrent Price: ${format_price(current_price)}\nMarket Cap: ${market_cap:,.0f}"
-                        await app.bot.send_message(chat_id=int(chat_id), text=text)
-                        # Deactivate after trigger
-                        user_alerts.remove(alert)
-                        save_alerts()
-                # Percent Change Alert
-                elif alert["type"] == "percent":
-                    # Dexscreener provides price change percentages
-                    # You can use 5m, 1h, 6h, 24h etc
-                    timeframe = alert.get("timeframe", "1h")  # default 1h
-                    change_key = {"5m":"priceChange5m","1h":"priceChange1h","6h":"priceChange6h","24h":"priceChange24h"}.get(timeframe,"priceChange1h")
-                    percent_change = float(pair.get(change_key,0))
-                    if percent_change >= alert["value"]:
-                        text = f"{token_name} ({symbol}) price increased by {percent_change:.2f}% over {timeframe}\nCurrent Price: ${format_price(current_price)}\nMarket Cap: ${market_cap:,.0f}"
-                        await app.bot.send_message(chat_id=int(chat_id), text=text)
-                        # Deactivate after trigger
-                        user_alerts.remove(alert)
-                        save_alerts()
+                    # Price Alert
+                    if alert["type"] == "price":
+                        if current_price >= alert["value"]:
+                            text = (
+                                f"{token_name} ({symbol}) went above ${format_price(alert['value'])}\n"
+                                f"Current Price: ${format_price(current_price)}\n"
+                                f"Market Cap: ${market_cap:,.0f}"
+                            )
+                            await app.bot.send_message(chat_id=int(chat_id), text=text)
+                            user_alerts.remove(alert)
+                            save_alerts()
+                    # Percent Change Alert
+                    elif alert["type"] == "percent":
+                        timeframe = alert.get("timeframe", "1h")
+                        change_key = {
+                            "5m": "priceChange5m",
+                            "1h": "priceChange1h",
+                            "6h": "priceChange6h",
+                            "24h": "priceChange24h"
+                        }.get(timeframe, "priceChange1h")
+                        percent_change = float(pair.get(change_key, 0))
+                        if percent_change >= alert["value"]:
+                            text = (
+                                f"{token_name} ({symbol}) price increased by {percent_change:.2f}% over {timeframe}\n"
+                                f"Current Price: ${format_price(current_price)}\n"
+                                f"Market Cap: ${market_cap:,.0f}"
+                            )
+                            await app.bot.send_message(chat_id=int(chat_id), text=text)
+                            user_alerts.remove(alert)
+                            save_alerts()
+        except Exception as e:
+            print("Error in polling task:", e)
         await asyncio.sleep(POLL_INTERVAL)
 
 # ------------------------
@@ -236,7 +261,7 @@ async def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_edit_response))
 
     # Start polling task
-    app.job_queue.run_repeating(lambda _: asyncio.create_task(price_polling_task(app)), interval=POLL_INTERVAL, first=1)
+    asyncio.create_task(price_polling_task(app))
 
     await app.run_polling()
 
