@@ -1,19 +1,17 @@
 import os
 import requests
-import time
-from telegram import Bot
-from telegram.ext import Updater, CommandHandler
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
-
-bot = Bot(token=BOT_TOKEN)
 
 alerts = {}
 
 DEX_API = "https://api.dexscreener.com/latest/dex/tokens/"
 
-# ---------- PRICE FORMATTER ----------
+
+# ---------- PRICE FORMAT ----------
 def format_price(price):
     return f"{price:.8f}".rstrip("0").rstrip(".")
 
@@ -36,13 +34,12 @@ def get_token_data(address):
             "mc": int(float(pair.get("fdv", 0))),
             "chart": f"https://dexscreener.com/{pair['chainId']}/{pair['pairAddress']}"
         }
-
     except:
         return None
 
 
-# ---------- ALERT LOOP ----------
-def monitor(context):
+# ---------- MONITOR LOOP ----------
+async def monitor(context: ContextTypes.DEFAULT_TYPE):
     for addr, target in alerts.items():
         token = get_token_data(addr)
         if not token:
@@ -61,7 +58,7 @@ def monitor(context):
                 f"Chart: {token['chart']}"
             )
 
-            bot.send_message(
+            await context.bot.send_message(
                 chat_id=CHAT_ID,
                 text=msg,
                 disable_web_page_preview=True
@@ -69,18 +66,18 @@ def monitor(context):
 
 
 # ---------- COMMANDS ----------
-def start(update, context):
-    update.message.reply_text("✅ Alert bot running")
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("✅ Alert bot running")
 
 
-def add(update, context):
+async def add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         address = context.args[0]
         price = float(context.args[1])
 
         token = get_token_data(address)
         if not token:
-            update.message.reply_text("❌ Token not found")
+            await update.message.reply_text("❌ Token not found")
             return
 
         alerts[address] = {
@@ -88,17 +85,16 @@ def add(update, context):
             "triggered": False
         }
 
-        update.message.reply_text(
+        await update.message.reply_text(
             f"✅ Alert added for {token['name']} ({token['symbol']})"
         )
-
     except:
-        update.message.reply_text("Usage: /add <token_address> <price>")
+        await update.message.reply_text("Usage: /add <token_address> <price>")
 
 
-def list_alerts(update, context):
+async def list_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not alerts:
-        update.message.reply_text("No active alerts")
+        await update.message.reply_text("No active alerts")
         return
 
     msg = "📊 Active Alerts:\n\n"
@@ -108,22 +104,20 @@ def list_alerts(update, context):
         if token:
             msg += f"{token['name']} — ${format_price(data['price'])}\n"
 
-    update.message.reply_text(msg)
+    await update.message.reply_text(msg)
 
 
 # ---------- MAIN ----------
 def main():
-    updater = Updater(BOT_TOKEN, use_context=True)
-    dp = updater.dispatcher
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    dp.add_handler(CommandHandler("start", start))
-    dp.add_handler(CommandHandler("add", add))
-    dp.add_handler(CommandHandler("list", list_alerts))
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("add", add))
+    app.add_handler(CommandHandler("list", list_alerts))
 
-    updater.job_queue.run_repeating(monitor, interval=30, first=10)
+    app.job_queue.run_repeating(monitor, interval=30, first=10)
 
-    updater.start_polling()
-    updater.idle()
+    app.run_polling()
 
 
 if __name__ == "__main__":
