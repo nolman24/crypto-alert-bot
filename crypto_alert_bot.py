@@ -1,27 +1,30 @@
 import os
 import requests
 import time
-import threading
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram import Bot
+from telegram.ext import Updater, CommandHandler
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
+bot = Bot(token=BOT_TOKEN)
+
 alerts = {}
 
+DEX_API = "https://api.dexscreener.com/latest/dex/tokens/"
 
-# =========================
-# FETCH DATA FROM DEXSCREENER
-# =========================
+# ---------- PRICE FORMATTER ----------
+def format_price(price):
+    return f"{price:.8f}".rstrip("0").rstrip(".")
+
+
+# ---------- FETCH TOKEN DATA ----------
 def get_token_data(address):
-    url = f"https://api.dexscreener.com/latest/dex/tokens/{address}"
-
     try:
-        r = requests.get(url, timeout=10)
+        r = requests.get(DEX_API + address, timeout=10)
         data = r.json()
 
-        if "pairs" not in data:
+        if not data.get("pairs"):
             return None
 
         pair = data["pairs"][0]
@@ -30,114 +33,97 @@ def get_token_data(address):
             "name": pair["baseToken"]["name"],
             "symbol": pair["baseToken"]["symbol"],
             "price": float(pair["priceUsd"]),
-            "market_cap": pair.get("fdv", 0),
-            "change_5m": pair["priceChange"].get("m5", "N/A"),
-            "change_1h": pair["priceChange"].get("h1", "N/A"),
-            "change_6h": pair["priceChange"].get("h6", "N/A"),
-            "change_24h": pair["priceChange"].get("h24", "N/A"),
-            "chart": pair["url"],
+            "mc": int(float(pair.get("fdv", 0))),
+            "chart": f"https://dexscreener.com/{pair['chainId']}/{pair['pairAddress']}"
         }
 
     except:
         return None
 
 
-# =========================
-# COMMANDS
-# =========================
-async def add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ---------- ALERT LOOP ----------
+def monitor(context):
+    for addr, target in alerts.items():
+        token = get_token_data(addr)
+        if not token:
+            continue
+
+        price = token["price"]
+
+        if price >= target["price"] and not target["triggered"]:
+            target["triggered"] = True
+
+            msg = (
+                "🚨🚨 DEX PRICE ALERT 🚨🚨\n\n"
+                f"{token['name']} ({token['symbol']}) went above ${format_price(target['price'])}\n\n"
+                f"Current Price: ${format_price(price)}\n"
+                f"Market Cap: ${token['mc']:,}\n\n"
+                f"Chart: {token['chart']}"
+            )
+
+            bot.send_message(
+                chat_id=CHAT_ID,
+                text=msg,
+                disable_web_page_preview=True
+            )
+
+
+# ---------- COMMANDS ----------
+def start(update, context):
+    update.message.reply_text("✅ Alert bot running")
+
+
+def add(update, context):
     try:
         address = context.args[0]
-        target = float(context.args[1])
+        price = float(context.args[1])
 
-        alerts[address] = target
+        token = get_token_data(address)
+        if not token:
+            update.message.reply_text("❌ Token not found")
+            return
 
-        await update.message.reply_text("✅ Alert added!")
+        alerts[address] = {
+            "price": price,
+            "triggered": False
+        }
+
+        update.message.reply_text(
+            f"✅ Alert added for {token['name']} ({token['symbol']})"
+        )
 
     except:
-        await update.message.reply_text("Usage:\n/add CONTRACT_ADDRESS PRICE")
+        update.message.reply_text("Usage: /add <token_address> <price>")
 
 
-async def list_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def list_alerts(update, context):
     if not alerts:
-        await update.message.reply_text("No active alerts.")
+        update.message.reply_text("No active alerts")
         return
 
-    msg = "📋 Active Alerts:\n\n"
-    for addr, price in alerts.items():
-        msg += f"{addr[:6]}... → ${price}\n"
+    msg = "📊 Active Alerts:\n\n"
 
-    await update.message.reply_text(msg)
+    for addr, data in alerts.items():
+        token = get_token_data(addr)
+        if token:
+            msg += f"{token['name']} — ${format_price(data['price'])}\n"
 
-
-async def remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        address = context.args[0]
-        alerts.pop(address, None)
-        await update.message.reply_text("❌ Alert removed.")
-    except:
-        await update.message.reply_text("Usage:\n/remove CONTRACT_ADDRESS")
+    update.message.reply_text(msg)
 
 
-# =========================
-# ALERT MONITOR LOOP
-# =========================
-def monitor():
-    print("Price alert monitor started...")
-
-    while True:
-        for addr, target_price in list(alerts.items()):
-            data = get_token_data(addr)
-            if not data:
-                continue
-
-            if data["price"] >= target_price:
-                message = f"""
-🚨🚨 DEX PRICE ALERT 🚨🚨
-
-{data['name']} ({data['symbol']}) went above ${target_price}
-
-Current Price: ${data['price']:.8f}
-Market Cap: ${data['market_cap']:,}
-
-Change (from DexScreener):
-5 min: {data['change_5m']}%
-1 hr: {data['change_1h']}%
-6 hr: {data['change_6h']}%
-24 hr: {data['change_24h']}
-
-📈 Chart:
-{data['chart']}
-"""
-
-                requests.post(
-                    f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                    json={
-                        "chat_id": CHAT_ID,
-                        "text": message,
-                        "disable_web_page_preview": True,
-                    },
-                )
-
-                alerts.pop(addr, None)
-
-        time.sleep(15)
-
-
-# =========================
-# START BOT
-# =========================
+# ---------- MAIN ----------
 def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    updater = Updater(BOT_TOKEN, use_context=True)
+    dp = updater.dispatcher
 
-    app.add_handler(CommandHandler("add", add))
-    app.add_handler(CommandHandler("list", list_alerts))
-    app.add_handler(CommandHandler("remove", remove))
+    dp.add_handler(CommandHandler("start", start))
+    dp.add_handler(CommandHandler("add", add))
+    dp.add_handler(CommandHandler("list", list_alerts))
 
-    threading.Thread(target=monitor, daemon=True).start()
+    updater.job_queue.run_repeating(monitor, interval=30, first=10)
 
-    print("Bot running...")
-    app.run_polling()
+    updater.start_polling()
+    updater.idle()
 
 
 if __name__ == "__main__":
