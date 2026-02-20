@@ -1,9 +1,13 @@
 import os
 import requests
 import uuid
-
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
+    CallbackQueryHandler,
+)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -43,54 +47,57 @@ def get_token_data(address):
         return None
 
 
-# ---------- MONITOR ----------
+# ---------- MONITOR LOOP ----------
 async def monitor(context: ContextTypes.DEFAULT_TYPE):
     for alert_id, alert in list(alerts.items()):
         token = get_token_data(alert["address"])
         if not token:
             continue
 
-        price = token["price"]
-
         # PRICE ALERT
-        if alert["type"] == "price" and not alert["triggered"]:
-            if price >= alert["target"]:
+        if alert["type"] == "price":
+            price = token["price"]
+
+            if price >= alert["price"] and not alert["triggered"]:
                 alert["triggered"] = True
 
                 msg = (
                     "🚨🚨 DEX PRICE ALERT 🚨🚨\n\n"
-                    f"{token['name']} ({token['symbol']}) crossed ${format_price(alert['target'])}\n\n"
+                    f"{token['name']} ({token['symbol']}) crossed ${format_price(alert['price'])}\n\n"
                     f"Current Price: ${format_price(price)}\n"
                     f"Market Cap: ${token['mc']:,}\n\n"
                     f"Chart: {token['chart']}"
                 )
 
-                keyboard = InlineKeyboardMarkup(
-                    [[InlineKeyboardButton("❌ Remove Alert", callback_data=f"del_{alert_id}")]]
+                await context.bot.send_message(
+                    CHAT_ID,
+                    msg,
+                    disable_web_page_preview=True
                 )
 
-                await context.bot.send_message(CHAT_ID, msg, reply_markup=keyboard, disable_web_page_preview=True)
+        # PUMP ALERT
+        if alert["type"] == "pump":
+            timeframe = alert["tf"]
+            threshold = alert["percent"]
 
-        # PERCENT ALERT
-        if alert["type"] == "percent" and not alert["triggered"]:
-            change = token[f"change{alert['time']}"]
+            change = token[f"change{timeframe}"]
 
-            if change >= alert["target"]:
+            if change >= threshold and not alert["triggered"]:
                 alert["triggered"] = True
 
                 msg = (
                     "🚀🚀 PUMP ALERT 🚀🚀\n\n"
-                    f"{token['name']} ({token['symbol']}) up {change:.2f}% in {alert['time']}\n\n"
-                    f"Price: ${format_price(price)}\n"
+                    f"{token['name']} ({token['symbol']}) is UP {change:.2f}% in {timeframe}\n\n"
+                    f"Current Price: ${format_price(token['price'])}\n"
                     f"Market Cap: ${token['mc']:,}\n\n"
                     f"Chart: {token['chart']}"
                 )
 
-                keyboard = InlineKeyboardMarkup(
-                    [[InlineKeyboardButton("❌ Remove Alert", callback_data=f"del_{alert_id}")]]
+                await context.bot.send_message(
+                    CHAT_ID,
+                    msg,
+                    disable_web_page_preview=True
                 )
-
-                await context.bot.send_message(CHAT_ID, msg, reply_markup=keyboard, disable_web_page_preview=True)
 
 
 # ---------- COMMANDS ----------
@@ -98,7 +105,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ Alert bot running")
 
 
-# ADD PRICE ALERT
 async def add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         address = context.args[0]
@@ -114,25 +120,26 @@ async def add(update: Update, context: ContextTypes.DEFAULT_TYPE):
         alerts[alert_id] = {
             "type": "price",
             "address": address,
-            "target": price,
-            "triggered": False
+            "price": price,
+            "triggered": False,
         }
 
-        await update.message.reply_text(f"✅ Price alert added for {token['symbol']}")
+        await update.message.reply_text(
+            f"✅ Price alert added for {token['symbol']}"
+        )
 
     except:
-        await update.message.reply_text("Usage: /add <address> <price>")
+        await update.message.reply_text("Usage: /add <token_address> <price>")
 
 
-# ADD PERCENT ALERT
 async def pump(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         address = context.args[0]
         percent = float(context.args[1])
-        timeframe = context.args[2]
+        tf = context.args[2]
 
-        if timeframe not in ["5m", "1h", "6h"]:
-            raise ValueError
+        if tf not in ["5m", "1h", "6h"]:
+            raise Exception
 
         token = get_token_data(address)
         if not token:
@@ -142,20 +149,24 @@ async def pump(update: Update, context: ContextTypes.DEFAULT_TYPE):
         alert_id = str(uuid.uuid4())[:8]
 
         alerts[alert_id] = {
-            "type": "percent",
+            "type": "pump",
             "address": address,
-            "target": percent,
-            "time": timeframe,
-            "triggered": False
+            "percent": percent,
+            "tf": tf,
+            "triggered": False,
         }
 
-        await update.message.reply_text(f"🚀 Pump alert set for {token['symbol']}")
+        await update.message.reply_text(
+            f"🚀 Pump alert set for {token['symbol']} {percent}% in {tf}"
+        )
 
     except:
-        await update.message.reply_text("Usage: /pump <address> <percent> <5m|1h|6h>")
+        await update.message.reply_text(
+            "Usage: /pump <address> <percent> <5m|1h|6h>"
+        )
 
 
-# LIST ALERTS
+# ---------- LIST ALERTS ----------
 async def list_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not alerts:
         await update.message.reply_text("No active alerts")
@@ -166,20 +177,25 @@ async def list_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not token:
             continue
 
+        if alert["type"] == "price":
+            text = (
+                f"📊 {token['name']} ({token['symbol']})\n"
+                f"Alert: ${format_price(alert['price'])}"
+            )
+        else:
+            text = (
+                f"🚀 {token['name']} ({token['symbol']})\n"
+                f"Pump Alert: {alert['percent']}% in {alert['tf']}"
+            )
+
         keyboard = InlineKeyboardMarkup(
             [[InlineKeyboardButton("❌ Remove Alert", callback_data=f"del_{alert_id}")]]
         )
 
-        if alert["type"] == "price":
-            msg = f"📊 {token['symbol']} → ${format_price(alert['target'])}"
-
-        else:
-            msg = f"📊 {token['symbol']} → {alert['target']}% in {alert['time']}"
-
-        await update.message.reply_text(msg, reply_markup=keyboard)
+        await update.message.reply_text(text, reply_markup=keyboard)
 
 
-# DELETE ALERT BUTTON
+# ---------- DELETE ALERT ----------
 async def delete_alert(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -201,7 +217,7 @@ def main():
     app.add_handler(CommandHandler("list", list_alerts))
     app.add_handler(CallbackQueryHandler(delete_alert, pattern="^del_"))
 
-    app.job_queue.run_repeating(monitor, interval=8, first=3)
+    app.job_queue.run_repeating(monitor, interval=8, first=5)
 
     app.run_polling()
 
